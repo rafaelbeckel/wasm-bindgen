@@ -80,8 +80,9 @@ export class Test {
         wasm.test_self_ref_mut_Self(this.__wbg_ptr);
     }
 }
+if (Symbol.dispose) Test.prototype[Symbol.dispose] = Test.prototype.free;
 
-export function __wbg_wbindgenthrow_c9e5e8466b626192(arg0, arg1) {
+export function __wbg_wbindgenthrow_4c11a24fca429ccf(arg0, arg1) {
     throw new Error(getStringFromWasm0(arg0, arg1));
 };
 

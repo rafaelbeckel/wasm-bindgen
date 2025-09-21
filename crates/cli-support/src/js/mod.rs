@@ -174,6 +174,10 @@ impl<'a> Context<'a> {
         self.exposed_globals.as_mut().unwrap().insert(name.into())
     }
 
+    fn has_global(&self, name: &str) -> bool {
+        self.exposed_globals.as_ref().unwrap().contains(name)
+    }
+
     fn export(
         &mut self,
         export_name: &str,
@@ -210,6 +214,7 @@ impl<'a> Context<'a> {
             OutputMode::Bundler { .. }
             | OutputMode::Node { module: true }
             | OutputMode::Web
+            | OutputMode::Module
             | OutputMode::Deno => match export {
                 ExportJs::Class(class) => {
                     assert_eq!(export_name, definition_name);
@@ -598,6 +603,28 @@ __wbg_set_wasm(wasm);"
                 footer.push_str("export { initSync };\n");
                 footer.push_str("export default __wbg_init;");
             }
+
+            // For source phase imports, we need to instantiate the module
+            OutputMode::Module => {
+                js.push_str("let wasm;\n");
+
+                // Generate the import object similar to Deno
+                let (js_imports, wasm_import_object) = self.generate_deno_imports();
+                imports.push_str(&js_imports);
+
+                // Add instantiation code using wasmModule from source import
+                footer.push_str(&wasm_import_object);
+                footer.push_str(
+                    "
+const wasmInstance = new WebAssembly.Instance(wasmModule, imports);
+wasm = wasmInstance.exports;
+",
+                );
+
+                if needs_manual_start {
+                    footer.push_str("\nwasm.__wbindgen_start();\n");
+                }
+            }
         }
 
         // Before putting the static init code declaration info, put all existing typescript into a `wasm_bindgen` namespace declaration.
@@ -691,6 +718,7 @@ __wbg_set_wasm(wasm);"
             OutputMode::Bundler { .. }
             | OutputMode::Node { module: true }
             | OutputMode::Web
+            | OutputMode::Module
             | OutputMode::Deno => {
                 for (module, items) in crate::sorted_iter(&self.js_imports) {
                     imports.push_str("import { ");
@@ -1069,13 +1097,25 @@ __wbg_set_wasm(wasm);"
         }
 
         if class.wrap_needed {
+            let (ptr_assignment, register_data) = if self.config.generate_reset_state {
+                (
+                    "\
+                    obj.__wbg_ptr = ptr;
+                    obj.__wbg_inst = __wbg_instance_id;
+                    ",
+                    "{ ptr, instance: __wbg_instance_id }",
+                )
+            } else {
+                ("obj.__wbg_ptr = ptr;", "obj.__wbg_ptr")
+            };
+
             dst.push_str(&format!(
                 "
                 static __wrap(ptr) {{
                     ptr = ptr >>> 0;
                     const obj = Object.create({name}.prototype);
-                    obj.__wbg_ptr = ptr;
-                    {name}Finalization.register(obj, obj.__wbg_ptr, obj);
+                    {ptr_assignment}
+                    {name}Finalization.register(obj, {register_data}, obj);
                     return obj;
                 }}
                 "
@@ -1095,12 +1135,25 @@ __wbg_set_wasm(wasm);"
             ));
         }
 
+        let finalization_callback = if self.config.generate_reset_state {
+            format!(
+                "({{ ptr, instance }}) => {{
+                if (instance === __wbg_instance_id) wasm.{}(ptr >>> 0, 1);
+            }}",
+                wasm_bindgen_shared::free_function(name)
+            )
+        } else {
+            format!(
+                "ptr => wasm.{}(ptr >>> 0, 1)",
+                wasm_bindgen_shared::free_function(name)
+            )
+        };
+
         self.global(&format!(
             "
             const {name}Finalization = (typeof FinalizationRegistry === 'undefined')
                 ? {{ register: () => {{}}, unregister: () => {{}} }}
-                : new FinalizationRegistry(ptr => wasm.{}(ptr >>> 0, 1));",
-            wasm_bindgen_shared::free_function(name),
+                : new FinalizationRegistry({finalization_callback});",
         ));
 
         // If the class is inspectable, generate `toJSON` and `toString`
@@ -1177,16 +1230,7 @@ __wbg_set_wasm(wasm);"
             wasm_bindgen_shared::free_function(name),
         ));
         ts_dst.push_str("  free(): void;\n");
-        if self.config.symbol_dispose {
-            dst.push_str(
-                "
-                [Symbol.dispose]() {{
-                    this.free();
-                }}
-                ",
-            );
-            ts_dst.push_str("  [Symbol.dispose](): void;\n");
-        }
+        ts_dst.push_str("  [Symbol.dispose](): void;\n");
         dst.push_str(&class.contents);
         ts_dst.push_str(&class.typescript);
 
@@ -1194,6 +1238,12 @@ __wbg_set_wasm(wasm);"
 
         dst.push('}');
         ts_dst.push_str("}\n");
+
+        dst.push_str(&format!(
+            "
+                if (Symbol.dispose) {name}.prototype[Symbol.dispose] = {name}.prototype.free;
+            "
+        ));
 
         self.export(name, ExportJs::Class(&dst), Some(&class.comments))?;
 
@@ -1356,7 +1406,7 @@ __wbg_set_wasm(wasm);"
         }
         assert!(!self.config.externref);
         self.global(&format!(
-            "const heap = new Array({INITIAL_HEAP_OFFSET}).fill(undefined);"
+            "let heap = new Array({INITIAL_HEAP_OFFSET}).fill(undefined);"
         ));
         self.global(&format!("heap.push({});", INITIAL_HEAP_VALUES.join(", ")));
     }
@@ -1678,14 +1728,6 @@ __wbg_set_wasm(wasm);"
         Ok(ret)
     }
 
-    fn expose_symbol_dispose(&mut self) -> Result<(), Error> {
-        if !self.should_write_global("symbol_dispose") {
-            return Ok(());
-        }
-        self.global("if(!Symbol.dispose) { Symbol.dispose = Symbol('Symbol.dispose'); }");
-        Ok(())
-    }
-
     fn expose_text_encoder(&mut self) -> Result<(), Error> {
         if !self.should_write_global("text_encoder") {
             return Ok(());
@@ -1793,6 +1835,7 @@ __wbg_set_wasm(wasm);"
                 self.global(&format!("{decl_kind} {cached_text_processor_init}"));
             }
             OutputMode::Deno
+            | OutputMode::Module
             | OutputMode::Web
             | OutputMode::NoModules { .. }
             | OutputMode::Bundler { browser_only: true } => {
@@ -1805,6 +1848,7 @@ __wbg_set_wasm(wasm);"
         if let Some(init) = init {
             match &self.config.mode {
                 OutputMode::Node { .. }
+                | OutputMode::Module
                 | OutputMode::Bundler {
                     browser_only: false,
                 } => self.global(init),
@@ -1845,6 +1889,7 @@ __wbg_set_wasm(wasm);"
                 format!("cached{s} = new l{s}{args};")
             }
             OutputMode::Deno
+            | OutputMode::Module
             | OutputMode::Web
             | OutputMode::NoModules { .. }
             | OutputMode::Bundler { browser_only: true } => {
@@ -2458,11 +2503,25 @@ __wbg_set_wasm(wasm);"
         // while we invoke it. If we finish and the closure wasn't
         // destroyed, then we put back the pointer so a future
         // invocation can succeed.
+        let (state_init, instance_check) = if self.config.generate_reset_state {
+            (
+                "const state = { a: arg0, b: arg1, cnt: 1, dtor, instance: __wbg_instance_id };",
+                "
+                if (state.instance !== __wbg_instance_id) {
+                    throw new Error('Cannot invoke closure from previous WASM instance');
+                }
+                ",
+            )
+        } else {
+            ("const state = { a: arg0, b: arg1, cnt: 1, dtor };", "")
+        };
+
         self.global(&format!(
             "
             function makeMutClosure(arg0, arg1, dtor, f) {{
-                const state = {{ a: arg0, b: arg1, cnt: 1, dtor }};
+                {state_init}
                 const real = (...args) => {{
+                    {instance_check}
                     // First up with a closure we increment the internal reference
                     // count. This ensures that the Rust closure environment won't
                     // be deallocated while we're invoking it.
@@ -2484,7 +2543,7 @@ __wbg_set_wasm(wasm);"
                 CLOSURE_DTORS.register(real, state, state);
                 return real;
             }}
-            ",
+            "
         ));
 
         Ok(())
@@ -2504,11 +2563,25 @@ __wbg_set_wasm(wasm);"
         // executing the destructor, however, we clear out the
         // `this.a` pointer to prevent it being used again the
         // future.
+        let (state_init, instance_check) = if self.config.generate_reset_state {
+            (
+                "const state = { a: arg0, b: arg1, cnt: 1, dtor, instance: __wbg_instance_id };",
+                "
+                if (state.instance !== __wbg_instance_id) {
+                    throw new Error('Cannot invoke closure from previous WASM instance');
+                }
+                ",
+            )
+        } else {
+            ("const state = { a: arg0, b: arg1, cnt: 1, dtor };", "")
+        };
+
         self.global(&format!(
             "
             function makeClosure(arg0, arg1, dtor, f) {{
-                const state = {{ a: arg0, b: arg1, cnt: 1, dtor }};
+                {state_init}
                 const real = (...args) => {{
+                    {instance_check}
                     // First up with a closure we increment the internal reference
                     // count. This ensures that the Rust closure environment won't
                     // be deallocated while we're invoking it.
@@ -2517,8 +2590,7 @@ __wbg_set_wasm(wasm);"
                         return f(state.a, state.b, ...args);
                     }} finally {{
                         if (--state.cnt === 0) {{
-                            wasm.{table}.get(state.dtor)(state.a, state.b);
-                            state.a = 0;
+                            wasm.{table}.get(state.dtor)(state.a, state.b); state.a = 0;
                             CLOSURE_DTORS.unregister(state);
                         }}
                     }}
@@ -2527,7 +2599,7 @@ __wbg_set_wasm(wasm);"
                 CLOSURE_DTORS.register(real, state, state);
                 return real;
             }}
-            ",
+            "
         ));
 
         Ok(())
@@ -2538,18 +2610,119 @@ __wbg_set_wasm(wasm);"
             return Ok(());
         }
         let table = self.export_function_table()?;
+
+        let finalization_callback = if self.config.generate_reset_state {
+            format!(
+                "
+                state => {{
+                    if (state.instance === __wbg_instance_id) {{
+                        wasm.{table}.get(state.dtor)(state.a, state.b);
+                    }}
+                }}
+                "
+            )
+        } else {
+            format!(
+                "
+                state => {{
+                    wasm.{table}.get(state.dtor)(state.a, state.b);
+                }}
+                "
+            )
+        };
+
         self.global(&format!(
             "
             const CLOSURE_DTORS = (typeof FinalizationRegistry === 'undefined')
                 ? {{ register: () => {{}}, unregister: () => {{}} }}
-                : new FinalizationRegistry(state => {{
-                    wasm.{table}.get(state.dtor)(state.a, state.b)
-                }});
+                : new FinalizationRegistry({finalization_callback});
             "
         ));
 
         Ok(())
     }
+
+    fn generate_reset_state(&mut self) -> Result<(), Error> {
+        self.global("let __wbg_instance_id = 0;");
+
+        let mut reset_statements = Vec::new();
+
+        reset_statements.push("__wbg_instance_id++;".to_string());
+
+        for (num, kinds) in self.memories.values() {
+            for kind in kinds {
+                let memview_name = format!("get{}Memory", kind);
+                if self.has_global(memview_name.as_str()) {
+                    reset_statements.push(format!("cached{kind}Memory{num} = null;"));
+                }
+            }
+        }
+
+        // Conditionally reset globals based on whether they were used
+        if self.has_global("text_decoder") {
+            reset_statements.push(
+                "if (typeof numBytesDecoded !== 'undefined') numBytesDecoded = 0;".to_string(),
+            );
+        }
+
+        if self.has_global("wasm_vector_len") {
+            reset_statements.push(
+                "if (typeof WASM_VECTOR_LEN !== 'undefined') WASM_VECTOR_LEN = 0;".to_string(),
+            );
+        }
+
+        if self.has_global("heap") {
+            let mut heap_reset = format!(
+                "\
+                    if (typeof heap !== 'undefined') {{
+                        heap = new Array({INITIAL_HEAP_OFFSET}).fill(undefined);
+                        heap = heap.concat([{}]);
+                ",
+                INITIAL_HEAP_VALUES.join(", ")
+            );
+
+            if self.has_global("heap_next") {
+                heap_reset.push_str(
+                    "\
+                        if (typeof heap_next !== 'undefined')
+                            heap_next = heap.length;
+                    ",
+                );
+            }
+
+            if self.has_global("stack_pointer") {
+                heap_reset.push_str(&format!(
+                    "\
+                        if (typeof stack_pointer !== 'undefined')
+                            stack_pointer = {INITIAL_HEAP_OFFSET};
+                    "
+                ));
+            }
+
+            heap_reset.push('}');
+            reset_statements.push(heap_reset);
+        }
+
+        reset_statements.push(
+            "\
+                const wasmInstance = new WebAssembly.Instance(wasmModule, imports);
+                wasm = wasmInstance.exports;
+                wasm.__wbindgen_start();
+            "
+            .to_string(),
+        );
+
+        let function_body = format!(" () {{\n{}}}", reset_statements.join("\n"));
+
+        self.export(
+            "__wbg_reset_state",
+            ExportJs::Function(&format!("function{function_body}")),
+            None,
+        )?;
+
+        Ok(())
+    }
+
     fn global(&mut self, s: &str) {
         let s = s.trim();
 
@@ -2753,11 +2926,6 @@ __wbg_set_wasm(wasm);"
 
     pub fn generate(&mut self) -> Result<(), Error> {
         self.prestore_global_import_identifiers()?;
-        // conditionally override Symbol.dispose
-        if self.config.symbol_dispose && !self.aux.structs.is_empty() {
-            self.expose_symbol_dispose()?;
-        }
-
         for (id, adapter, kind) in iter_adapeter(self.aux, self.wit, self.module) {
             let instrs = match &adapter.kind {
                 AdapterKind::Import { .. } => continue,
@@ -2788,6 +2956,11 @@ __wbg_set_wasm(wasm);"
         }
 
         self.export_destructor();
+
+        // Generate reset state function last, to ensure it knows about all other state.
+        if self.config.generate_reset_state {
+            self.generate_reset_state()?;
+        }
 
         Ok(())
     }
@@ -3092,9 +3265,7 @@ __wbg_set_wasm(wasm);"
                         call = Some(id);
                     }
                 }
-                Instruction::CallExport(_)
-                | Instruction::CallTableElement(_)
-                | Instruction::CallCore(_) => return Ok(false),
+                Instruction::CallExport(_) | Instruction::CallTableElement(_) => return Ok(false),
                 _ => {}
             }
         }
@@ -3516,6 +3687,7 @@ __wbg_set_wasm(wasm);"
                     let base = match self.config.mode {
                         OutputMode::Web
                         | OutputMode::Bundler { .. }
+                        | OutputMode::Module
                         | OutputMode::Deno
                         | OutputMode::Node { module: true } => "import.meta.url",
                         OutputMode::Node { module: false } => {
@@ -3816,10 +3988,10 @@ __wbg_set_wasm(wasm);"
                     OutputMode::Web | OutputMode::NoModules { .. } => {
                         "__wbg_init.__wbindgen_wasm_module"
                     }
-                    OutputMode::Node { .. } => "wasmModule",
+                    OutputMode::Node { .. } | OutputMode::Module => "wasmModule",
                     _ => bail!(
                         "`wasm_bindgen::module` is currently only supported with \
-                         `--target no-modules`, `--target web` and `--target nodejs`"
+                         `--target no-modules`, `--target web`, `--target module` and `--target nodejs`"
                     ),
                 }
                 .to_string()

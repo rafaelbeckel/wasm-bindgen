@@ -84,8 +84,9 @@ export class Test {
         wasm.test_test2(this.__wbg_ptr, test);
     }
 }
+if (Symbol.dispose) Test.prototype[Symbol.dispose] = Test.prototype.free;
 
-export function __wbg_wbindgenthrow_c9e5e8466b626192(arg0, arg1) {
+export function __wbg_wbindgenthrow_4c11a24fca429ccf(arg0, arg1) {
     throw new Error(getStringFromWasm0(arg0, arg1));
 };
 
